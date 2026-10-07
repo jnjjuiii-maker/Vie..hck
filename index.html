@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="id">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>CCTV - Monitor</title>
+<style>
+  html, body { margin:0; padding:0; background:#000; height:100%; }
+  body { font-family: sans-serif; color:#fff; display:flex; flex-direction:column; }
+  .bar { padding:10px 14px; display:flex; align-items:center; gap:8px; background:#111; flex-wrap:wrap; }
+  .dot { width:10px; height:10px; border-radius:50%; background:#555; flex-shrink:0; }
+  .dot.live { background:#43a047; }
+  .status { font-size:14px; }
+  .roomid { font-size:11px; color:#888; }
+  .video-wrap { flex:1; position:relative; background:#111; min-height:0; }
+  video { width:100%; height:100%; object-fit:contain; background:#111; display:block; }
+  .controls {
+    position:absolute; bottom:18px; left:0; right:0;
+    display:flex; align-items:center; justify-content:center; gap:16px;
+  }
+  .ctrl-btn {
+    width:52px; height:52px; border-radius:50%;
+    background:rgba(255,255,255,0.15); border:1px solid rgba(255,255,255,0.3);
+    color:#fff; font-size:22px; display:flex; align-items:center; justify-content:center;
+    cursor:pointer; backdrop-filter: blur(4px);
+  }
+  .ctrl-btn:active { background:rgba(255,255,255,0.3); }
+  .ctrl-btn.recording { background:#e53935; border-color:#e53935; }
+  .rec-timer {
+    position:absolute; top:14px; right:14px; background:rgba(229,57,53,0.85);
+    color:#fff; font-size:12px; padding:4px 10px; border-radius:12px; display:none;
+  }
+  .rec-timer.show { display:block; }
+  .flash { position:absolute; inset:0; background:#fff; opacity:0; pointer-events:none; }
+  .flash.go { animation: flashAnim .25s ease-out; }
+  @keyframes flashAnim { 0%{opacity:.8} 100%{opacity:0} }
+  .log { padding:6px 14px; font-size:10px; color:#666; max-height:70px; overflow-y:auto; background:#0a0a0a; }
+</style>
+</head>
+<body>
+  <div class="bar">
+    <div class="dot" id="dot"></div>
+    <div>
+      <div class="status" id="status">Menyambung ke signaling server...</div>
+      <div class="roomid">Room: <span id="roomLabel"></span></div>
+    </div>
+  </div>
+  <div class="video-wrap">
+    <video id="remoteVideo" autoplay playsinline></video>
+    <div class="flash" id="flash"></div>
+    <div class="rec-timer" id="recTimer">● 00:00</div>
+    <div class="controls">
+      <div class="ctrl-btn" id="photoBtn" title="Ambil foto">📷</div>
+      <div class="ctrl-btn" id="switchBtn" title="Ganti kamera depan/belakang">🔄</div>
+      <div class="ctrl-btn" id="recordBtn" title="Rekam video">⏺️</div>
+    </div>
+  </div>
+  <div class="log" id="log"></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/peerjs/1.5.4/peerjs.min.js"></script>
+<script>
+const ROOM_ID = 'cctv-rumah-anda-12345'; // HARUS sama persis dengan camera.html
+const CAMERA_PEER_ID = ROOM_ID + '-camera';
+
+document.getElementById('roomLabel').textContent = ROOM_ID;
+
+const dot = document.getElementById('dot');
+const statusEl = document.getElementById('status');
+const logEl = document.getElementById('log');
+const remoteVideo = document.getElementById('remoteVideo');
+const switchBtn = document.getElementById('switchBtn');
+const photoBtn = document.getElementById('photoBtn');
+const recordBtn = document.getElementById('recordBtn');
+const recTimer = document.getElementById('recTimer');
+const flashEl = document.getElementById('flash');
+
+let currentRemoteStream = null;
+
+function timestamp() {
+  const d = new Date();
+  const pad = n => String(n).padStart(2, '0');
+  return `${d.getFullYear()}${pad(d.getMonth()+1)}${pad(d.getDate())}-${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+}
+
+function downloadBlob(blob, filename) {
+  const url = URL.createObjectURL(blob);
+  const a = document.createElement('a');
+  a.href = url;
+  a.download = filename;
+  document.body.appendChild(a);
+  a.click();
+  a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 5000);
+}
+
+// ====== Ambil foto dari frame video saat ini ======
+photoBtn.addEventListener('click', () => {
+  if (!remoteVideo.videoWidth) { log('Belum ada video untuk difoto'); return; }
+  const canvas = document.createElement('canvas');
+  canvas.width = remoteVideo.videoWidth;
+  canvas.height = remoteVideo.videoHeight;
+  canvas.getContext('2d').drawImage(remoteVideo, 0, 0, canvas.width, canvas.height);
+  canvas.toBlob((blob) => {
+    if (!blob) { log('Gagal membuat foto'); return; }
+    downloadBlob(blob, 'cctv-foto-' + timestamp() + '.png');
+    log('Foto disimpan');
+  }, 'image/png');
+  flashEl.classList.remove('go'); void flashEl.offsetWidth; flashEl.classList.add('go');
+});
+
+// ====== Rekam video ======
+let mediaRecorder = null;
+let recordedChunks = [];
+let recording = false;
+let recordStartTime = 0;
+let recordTimerInterval = null;
+
+function pickMimeType() {
+  const options = ['video/webm;codecs=vp9,opus', 'video/webm;codecs=vp8,opus', 'video/webm', 'video/mp4'];
+  for (const opt of options) {
+    if (MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(opt)) return opt;
+  }
+  return '';
+}
+
+function updateRecTimer() {
+  const elapsed = Math.floor((Date.now() - recordStartTime) / 1000);
+  const mm = String(Math.floor(elapsed / 60)).padStart(2, '0');
+  const ss = String(elapsed % 60).padStart(2, '0');
+  recTimer.textContent = '● ' + mm + ':' + ss;
+}
+
+recordBtn.addEventListener('click', () => {
+  if (!recording) {
+    if (!currentRemoteStream) { log('Belum ada stream untuk direkam'); return; }
+    recordedChunks = [];
+    const mimeType = pickMimeType();
+    try {
+      mediaRecorder = mimeType
+        ? new MediaRecorder(currentRemoteStream, { mimeType })
+        : new MediaRecorder(currentRemoteStream);
+    } catch (e) {
+      log('Gagal mulai rekam: ' + e.message);
+      return;
+    }
+    mediaRecorder.ondataavailable = (e) => { if (e.data && e.data.size > 0) recordedChunks.push(e.data); };
+    mediaRecorder.onstop = () => {
+      const blob = new Blob(recordedChunks, { type: mediaRecorder.mimeType || 'video/webm' });
+      const ext = (mediaRecorder.mimeType || '').includes('mp4') ? 'mp4' : 'webm';
+      downloadBlob(blob, 'cctv-rekaman-' + timestamp() + '.' + ext);
+      log('Rekaman disimpan (' + (blob.size / 1024 / 1024).toFixed(1) + ' MB)');
+      recordedChunks = [];
+    };
+    mediaRecorder.start();
+    recording = true;
+    recordStartTime = Date.now();
+    recTimer.classList.add('show');
+    updateRecTimer();
+    recordTimerInterval = setInterval(updateRecTimer, 1000);
+    recordBtn.textContent = '⏹️';
+    recordBtn.classList.add('recording');
+    log('Mulai merekam');
+  } else {
+    mediaRecorder.stop();
+    recording = false;
+    clearInterval(recordTimerInterval);
+    recTimer.classList.remove('show');
+    recordBtn.textContent = '⏺️';
+    recordBtn.classList.remove('recording');
+    log('Berhenti merekam');
+  }
+});
+
+function setStatus(text, live) { statusEl.textContent = text; dot.classList.toggle('live', !!live); }
+function log(msg) {
+  console.log(msg);
+  const line = document.createElement('div');
+  line.textContent = new Date().toLocaleTimeString() + ' - ' + msg;
+  logEl.prepend(line);
+}
+
+const ICE_SERVERS = [
+  { urls: 'stun:stun.l.google.com:19302' },
+  { urls: 'stun:stun.relay.metered.ca:80' },
+  { urls: 'turn:openrelay.metered.ca:80', username: 'openrelayproject', credential: 'openrelayproject' },
+  { urls: 'turn:openrelay.metered.ca:80?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' },
+  { urls: 'turn:openrelay.metered.ca:443', username: 'openrelayproject', credential: 'openrelayproject' },
+  { urls: 'turn:openrelay.metered.ca:443?transport=tcp', username: 'openrelayproject', credential: 'openrelayproject' }
+];
+
+let peer = null;
+let conn = null; // data connection ke kamera, dipakai juga untuk kirim perintah ganti kamera
+let retryTimer = null;
+
+function connect() {
+  peer = new Peer({ config: { iceServers: ICE_SERVERS } });
+
+  peer.on('open', (id) => {
+    log('Peer siap: ' + id);
+    setStatus('Menyambung ke kamera...', false);
+    reportToCamera();
+  });
+
+  peer.on('call', (call) => {
+    log('Menerima panggilan dari kamera');
+    call.answer();
+    call.on('stream', (remoteStream) => {
+      remoteVideo.srcObject = remoteStream;
+      currentRemoteStream = remoteStream;
+      setStatus('Live', true);
+      log('Stream diterima');
+    });
+    call.on('close', () => {
+      setStatus('Kamera terputus, mencoba ulang...', false);
+      remoteVideo.srcObject = null;
+      scheduleRetry();
+    });
+  });
+
+  peer.on('error', (err) => {
+    log('Peer error: ' + err.type);
+    setStatus('Koneksi bermasalah, mencoba lagi...', false);
+    scheduleRetry();
+  });
+
+  peer.on('disconnected', () => {
+    log('Disconnected, reconnecting...');
+    if (navigator.onLine) peer.reconnect();
+  });
+}
+
+function reportToCamera() {
+  conn = peer.connect(CAMERA_PEER_ID, { reliable: true });
+
+  conn.on('open', () => {
+    log('Terhubung ke kamera, menunggu video...');
+    setStatus('Menunggu video dari kamera...', false);
+  });
+
+  conn.on('error', (e) => {
+    log('Gagal menghubungi kamera: ' + e + ' (kamera mungkin belum online)');
+    setStatus('Kamera belum online, mencoba lagi...', false);
+    scheduleRetry();
+  });
+
+  conn.on('close', () => {
+    log('Koneksi ke kamera tertutup');
+    scheduleRetry();
+  });
+}
+
+function scheduleRetry() {
+  if (retryTimer) return;
+  retryTimer = setTimeout(() => {
+    retryTimer = null;
+    if (!navigator.onLine) return; // tunggu event 'online'
+    if (peer && !peer.destroyed && peer.open) {
+      reportToCamera();
+    } else if (!peer || peer.destroyed) {
+      connect();
+    }
+  }, 3000);
+}
+
+switchBtn.addEventListener('click', () => {
+  if (conn && conn.open) {
+    conn.send({ type: 'switch-camera' });
+    log('Perintah ganti kamera dikirim');
+  } else {
+    log('Belum terhubung ke kamera, tidak bisa ganti kamera');
+  }
+});
+
+// Auto-reconnect saat internet sempat putus lalu online lagi
+window.addEventListener('online', () => {
+  log('Internet kembali online');
+  if (!peer || peer.destroyed) {
+    connect();
+  } else if (peer.disconnected) {
+    peer.reconnect();
+  } else if (!conn || !conn.open) {
+    reportToCamera();
+  }
+});
+window.addEventListener('offline', () => {
+  log('Internet terputus');
+  setStatus('Internet terputus...', false);
+});
+
+connect();
+</script>
+</body>
+</html>
